@@ -5,14 +5,13 @@ import aiohttp
 import argparse
 import csv
 import hashlib
-import json
 import re
 import sys
-import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin, quote
+from xml.etree import ElementTree as ET
 
 try:
     from bs4 import BeautifulSoup
@@ -56,10 +55,10 @@ class ArchivportalScraper:
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
         self.results: list[Initiative] = []
-        self.seen_hashes: dict[str, str] = {}  # hash -> html_source
-        self.errors: list[dict] = []  # Erreurs réseau
-        self.duplicates: list[dict] = []  # Doublons ignorés
-        self.parse_failures: list[dict] = []  # Échecs de parsing
+        self.seen_hashes: set[str] = set()
+        self.errors: list[dict] = []
+        self.duplicates: list[dict] = []
+        self.parse_failures: list[dict] = []
         self.semaphore = asyncio.Semaphore(MAX_CONCURRENT)
         self.nlp = spacy.load('de_core_news_md')
 
@@ -146,8 +145,9 @@ class ArchivportalScraper:
     }
 
     _ARCHIVE_STRIP = re.compile(
-        r'^(?:[A-ZÄÖÜ][a-zäöüß]+(?:s|es|isches?|ische|er|ern)\s+)?'  # adjectif optionnel
-        r'(?:des\s+)?(?:Landkreises?\s+|Kreises?\s+)?'                 # préfixe géo optionnel
+        r'^(?:[A-ZÄÖÜ][a-zäöüß]+(?:s|es|isches?|ische|er|ern)\s+)?'
+        r'[A-Za-zäöüÄÖÜß]*[Aa]rchiv\w*\s*'
+        r'(?:des\s+)?(?:Landkreises?\s+|Kreises?\s+)?'
     )
 
     _ADJEKTIV_LAND = {
@@ -156,6 +156,7 @@ class ArchivportalScraper:
         r'[Bb]randenburg': 'Brandenburg',
         r'[Hh]ess': 'Hessen',
         r'[Tt]hüring': 'Thüringen',
+        r'[Nn]iedersächs': 'Niedersachsen',
         r'[Mm]ecklenb': 'Mecklenburg-Vorpommern',
         r'[Ww]estfäl': 'Nordrhein-Westfalen',
         r'[Ss]aarländ': 'Saarland',
@@ -184,6 +185,7 @@ class ArchivportalScraper:
             if re.search(pattern, name):
                 return land
         return None
+
     def extract_location_ner(self, meta_text: str, institution: str, titre: str = "") -> str:
         """Extrait le lieu via NER spaCy, d'abord sur l'institution puis sur le meta."""
         if institution and any(w in institution.lower() for w in ('archiv', 'bibliothek')):
@@ -212,16 +214,18 @@ class ArchivportalScraper:
                 if len(name) <= 2 or name.lower() in self._ARCHIVE_WORDS:
                     continue
                 if not name[0].isupper():
-                    continue  # Commence par minuscule ("für soziale Bewegung")
+                    continue
                 if re.search(r'\d', name):
+                    continue
                 if re.match(r'^[A-ZÄÖÜ][\s\-]', name):
-                    continue  # Lettre isolée ("F Rep", "D 10")
+                    continue
                 if len(name) <= 8 and len(name) >= 2 and name[1].isupper():
-                    continue  # Abréviations ("BArch" → B+A, "APlGr" → A+P, "NRW" → N+R)
+                    continue
                 if re.search(r'\.{2,}', name):
-                    continue  # Contient des points de suspension
+                    continue
 
                 name = re.sub(r'^(?:Landkreises?|Kreises?)\s+', '', name).strip()
+                if not name or len(name) <= 2:
                     continue
 
                 if ent.end < len(doc) and doc[ent.end].text in ('Kreis', 'Land'):
@@ -306,18 +310,48 @@ class ArchivportalScraper:
 
         return results
 
+    async def fetch_oai_location(self, item_id: str) -> Optional[str]:
+        oai_url = (
+            "https://oai.deutsche-digitale-bibliothek.de/"
+            f"?verb=GetRecord&metadataPrefix=ddb&identifier={item_id}"
+        )
+        xml_text = await self.fetch(oai_url)
+        if not xml_text:
+            return None
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError:
+            return None
+
+        EDM = 'http://www.europeana.eu/schemas/edm/'
+        for dp in root.iter(f'{{{EDM}}}dataProvider'):
+            name = (dp.text or '').strip()
+            if not name:
+                continue
+            lieu = self.extract_location_ner(name, name)
+            if lieu != "Non spécifié":
+                return lieu
+
+        return None
+
     async def fetch_detail_location(self, url: str) -> Optional[str]:
         html = await self.fetch(url)
         if not html:
             return None
 
         soup = BeautifulSoup(html, 'html.parser')
+
+        for a in soup.find_all('a', href=lambda h: h and '/organization/' in h):
             text = a.get_text(strip=True)
             if not text:
                 continue
             lieu = self.extract_location_ner(text, text)
             if lieu != "Non spécifié":
                 return lieu
+
+        match = re.search(r'/item/([A-Z0-9]+)', url)
+        if match:
+            return await self.fetch_oai_location(match.group(1))
 
         return None
 
@@ -346,20 +380,15 @@ class ArchivportalScraper:
         pbar.close()
         return found
 
-    def add_result(self, initiative: Initiative, html_source: str = "") -> bool:
+    def add_result(self, initiative: Initiative) -> bool:
         key = initiative.hash_key()
         if key in self.seen_hashes:
             self.duplicates.append({
                 'titre': initiative.titre,
-                'periode': initiative.periode,
-                'lieu': initiative.lieu,
                 'url': initiative.url,
-                'raison': 'doublon',
-                'html_doublon': html_source,
-                'html_original': self.seen_hashes[key]
             })
             return False
-        self.seen_hashes[key] = html_source
+        self.seen_hashes.add(key)
         self.results.append(initiative)
         return True
 
@@ -386,7 +415,7 @@ class ArchivportalScraper:
             if html:
                 items = await self.parse_list_page(html, page_url=url)
                 for item, item_html in items:
-                    if self.add_result(item, item_html):
+                    if self.add_result(item):
                         pbar.update(1)
 
         batch_size = 10
