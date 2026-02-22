@@ -5,6 +5,7 @@ import aiohttp
 import argparse
 import csv
 import hashlib
+import json
 import re
 import sys
 import time
@@ -16,6 +17,7 @@ from urllib.parse import urljoin, quote
 try:
     from bs4 import BeautifulSoup
     from tqdm import tqdm
+    import spacy
 except ImportError as e:
     print(f"Error: missing dependencies")
     print(f"  Linux/Mac: ./setup.sh")
@@ -30,29 +32,6 @@ MAX_CONCURRENT = 30
 TIMEOUT = 30
 
 
-GERMAN_CITIES = {
-    'berlin', 'hamburg', 'münchen', 'munich', 'köln', 'cologne', 'frankfurt',
-    'stuttgart', 'düsseldorf', 'dortmund', 'essen', 'leipzig', 'bremen',
-    'dresden', 'hannover', 'nürnberg', 'duisburg', 'bochum', 'wuppertal',
-    'bielefeld', 'bonn', 'münster', 'karlsruhe', 'mannheim', 'augsburg',
-    'wiesbaden', 'gelsenkirchen', 'mönchengladbach', 'braunschweig', 'chemnitz',
-    'kiel', 'aachen', 'halle', 'magdeburg', 'freiburg', 'krefeld', 'lübeck',
-    'oberhausen', 'erfurt', 'mainz', 'rostock', 'kassel', 'hagen', 'hamm',
-    'saarbrücken', 'mülheim', 'potsdam', 'ludwigshafen', 'oldenburg', 'leverkusen',
-    'osnabrück', 'solingen', 'heidelberg', 'herne', 'neuss', 'darmstadt',
-    'paderborn', 'regensburg', 'ingolstadt', 'würzburg', 'wolfsburg', 'ulm',
-    'heilbronn', 'pforzheim', 'göttingen', 'bottrop', 'trier', 'recklinghausen',
-    'reutlingen', 'bremerhaven', 'koblenz', 'bergisch gladbach', 'jena',
-    'remscheid', 'erlangen', 'moers', 'siegen', 'hildesheim', 'salzgitter',
-    'dormagen', 'wertheim', 'aichelberg', 'wyhl', 'gorleben', 'brokdorf',
-    'kalkar', 'wackersdorf', 'grohnde', 'biblis', 'neckarwestheim',
-    # Régions
-    'baden-württemberg', 'bayern', 'bavaria', 'brandenburg', 'hessen',
-    'mecklenburg-vorpommern', 'niedersachsen', 'nordrhein-westfalen', 'nrw',
-    'rheinland-pfalz', 'saarland', 'sachsen', 'sachsen-anhalt', 'schleswig-holstein',
-    'thüringen', 'rhein-kreis', 'schwarzwald', 'eifel', 'hunsrück', 'taunus',
-}
-
 
 @dataclass
 class Initiative:
@@ -66,7 +45,9 @@ class Initiative:
         return asdict(self)
 
     def hash_key(self) -> str:
-        """Clé unique pour déduplication."""
+        match = re.search(r'/item/([A-Z0-9]+)', self.url)
+        if match:
+            return match.group(1)
         key = f"{self.titre.lower().strip()}|{self.periode}|{self.lieu.lower().strip()}"
         return hashlib.md5(key.encode()).hexdigest()
 
@@ -75,11 +56,12 @@ class ArchivportalScraper:
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
         self.results: list[Initiative] = []
-        self.seen_hashes: set[str] = set()
+        self.seen_hashes: dict[str, str] = {}  # hash -> html_source
         self.errors: list[dict] = []  # Erreurs réseau
         self.duplicates: list[dict] = []  # Doublons ignorés
         self.parse_failures: list[dict] = []  # Échecs de parsing
         self.semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+        self.nlp = spacy.load('de_core_news_md')
 
     async def __aenter__(self):
         timeout = aiohttp.ClientTimeout(total=TIMEOUT)
@@ -157,51 +139,122 @@ class ArchivportalScraper:
 
         return "Non spécifiée"
 
-    def extract_location(self, text: str, title: str = "", context: str = "") -> str:
-        combined = f"{title} {text} {context}".lower()
+    # Mots d'archive qui ne sont pas des lieux
+    _ARCHIVE_WORDS = {
+        'stadtarchiv', 'kreisarchiv', 'landesarchiv', 'hauptstaatsarchiv',
+        'bundesarchiv', 'archiv', 'sammlung', 'bibliothek', 'bürgerinitiativen',
+        'staatsarchiv', 'universitätsarchiv', 'bezirksarchiv', 'gemeindearchiv',
+    }
 
-        found_cities = []
-        for city in GERMAN_CITIES:
-            if city in combined:
-                pattern = r'\b' + re.escape(city) + r'\b'
-                if re.search(pattern, combined):
-                    found_cities.append(city.title())
+    # Regex pour enlever le préfixe archive d'un nom d'ORG/LOC
+    # Gère les mots composés (Kreisarchiv, Landeshauptarchiv) et les adjectifs (Bayerisches)
+    _ARCHIVE_STRIP = re.compile(
+        r'^(?:[A-ZÄÖÜ][a-zäöüß]+(?:s|es|isches?|ische|er|ern)\s+)?'  # adjectif optionnel
+        r'[A-Za-zäöüÄÖÜß]*[Aa]rchiv\w*\s*'                            # mot d'archive composé
+        r'(?:des\s+)?(?:Landkreises?\s+|Kreises?\s+)?'                 # préfixe géo optionnel
+    )
 
-        if found_cities:
-            return found_cities[0]
+    # Adjectifs de Länder → nom du Land
+    _ADJEKTIV_LAND = {
+        r'[Bb]ayer': 'Bayern',
+        r'[Ss]ächs': 'Sachsen',
+        r'[Bb]randenburg': 'Brandenburg',
+        r'[Hh]ess': 'Hessen',
+        r'[Tt]hüring': 'Thüringen',
+        r'[Nn]iedersächs': 'Niedersachsen',
+        r'[Mm]ecklenb': 'Mecklenburg-Vorpommern',
+        r'[Ww]estfäl': 'Nordrhein-Westfalen',
+        r'[Ss]aarländ': 'Saarland',
+        r'[Ss]chlwig|[Ss]chleswig': 'Schleswig-Holstein',
+        r'[Hh]amburg': 'Hamburg',
+        r'[Bb]remer': 'Bremen',
+        r'[Bb]erliner': 'Berlin',
+    }
 
-        location_patterns = [
-            r'\bin\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)',
-            r'\bbei\s+([A-ZÄÖÜ][a-zäöüß]+)',
-            r'\baus\s+([A-ZÄÖÜ][a-zäöüß]+)',
-            r'\bRegion\s+([A-ZÄÖÜ][a-zäöüß]+)',
-            r'\bKreis\s+([A-ZÄÖÜ][a-zäöüß]+)',
-            r'\bStadt\s+([A-ZÄÖÜ][a-zäöüß]+)',
-        ]
+    def _loc_from_archive_name(self, name: str) -> Optional[str]:
+        """Extrait le lieu depuis un nom d'archive (LOC ou ORG contenant 'archiv')."""
+        stripped = self._ARCHIVE_STRIP.sub('', name).strip()
+        stripped = re.sub(r'^(?:des|der)\s+', '', stripped).strip()
+        # Nettoyer les suffixes parasites: parenthèses, points de suspension, ellipses
+        stripped = re.sub(r'\s*[\(\[\.]{1,}.*', '', stripped, flags=re.DOTALL).strip()
+        if stripped and len(stripped) > 2 and stripped[0].isupper() and stripped.lower() not in self._ARCHIVE_WORDS:
+            return stripped
+        for pattern, land in self._ADJEKTIV_LAND.items():
+            if re.search(pattern, name):
+                return land
+        return None
 
-        full_text = f"{title} {text} {context}"
-        for pattern in location_patterns:
-            match = re.search(pattern, full_text)
-            if match:
-                loc = match.group(1)
-                # Filtrer les faux positifs communs
-                if loc.lower() not in ['der', 'die', 'das', 'und', 'oder', 'für', 'gegen']:
-                    return loc
+    def extract_location_ner(self, meta_text: str, institution: str) -> str:
+        """Extrait le lieu via NER spaCy, d'abord sur l'institution puis sur le meta."""
+        # Recherche en deux passes: institution seule (fiable), puis meta complet (fallback)
+        for text in (institution, f"{institution} {meta_text}"):
+            doc = self.nlp(text)
 
-        archive_match = re.search(r'(?:Stadtarchiv|Landesarchiv|Archiv)\s+([A-ZÄÖÜ][a-zäöüß-]+)', text)
-        if archive_match:
-            return f"(Archive: {archive_match.group(1)})"
+            for ent in doc.ents:
+                if ent.label_ not in ('LOC', 'GPE', 'ORG'):
+                    continue
+
+                name = ent.text.strip()
+
+                # Nom d'archive (LOC ou ORG): extraire la partie géographique
+                if any(w in name.lower() for w in ('archiv', 'bibliothek')):
+                    result = self._loc_from_archive_name(name)
+                    if result:
+                        return result
+                    continue
+
+                if ent.label_ == 'ORG':
+                    continue
+
+                # LOC/GPE: filtrer les faux positifs
+                if len(name) <= 2 or name.lower() in self._ARCHIVE_WORDS:
+                    continue
+                if not name[0].isupper():
+                    continue  # Commence par minuscule ("für soziale Bewegung")
+                if re.search(r'\d', name):
+                    continue  # Contient des chiffres (références d'archive)
+                if re.match(r'^[A-ZÄÖÜ][\s\-]', name):
+                    continue  # Lettre isolée ("F Rep", "D 10")
+                if len(name) <= 8 and len(name) >= 2 and name[1].isupper():
+                    continue  # Abréviations ("BArch" → B+A, "APlGr" → A+P, "NRW" → N+R)
+                if re.search(r'\.{2,}', name):
+                    continue  # Contient des points de suspension
+
+                # Nettoyer préfixes administratifs ("Landkreises Barnim" → "Barnim")
+                name = re.sub(r'^(?:Landkreises?|Kreises?)\s+', '', name).strip()
+                if not name or len(name) <= 2:
+                    continue
+
+                # Adjectif seul ("Märkischer") → inclure "Kreis" si suit
+                if ent.end < len(doc) and doc[ent.end].text in ('Kreis', 'Land'):
+                    name = f"{name} {doc[ent.end].text}"
+
+                return name
 
         return "Non spécifié"
 
     def extract_institution(self, text: str) -> str:
+        """Extrait l'institution depuis le texte meta (format: date, institution, reference)."""
+        # Le texte est souvent: "1977-1980, Stadtarchiv Tübingen, D 10/251 ..."
+        # On cherche la partie entre la première et deuxième virgule après la date
+
+        # Pattern pour capturer l'institution après la date
+        match = re.search(r'^\s*[\d\-–\s\.]+,\s*([^,]+(?:,[^,]+)?)', text)
+        if match:
+            institution = match.group(1).strip()
+            # Vérifier que ça ressemble à une institution (contient archiv, bibliothek, etc.)
+            if re.search(r'(?:archiv|bibliothek|museum|institut|sammlung)', institution, re.IGNORECASE):
+                return institution
+
+        # Fallback: chercher des patterns connus
         patterns = [
-            r'((?:Stadt|Landes|Bundes)?[Aa]rchiv[^,\n]+)',
-            r'(Archiv\s+(?:für|im|der)[^,\n]+)',
+            r'((?:Stadt|Landes|Bundes|Kreis|Universitäts)[a-zäöüß]*archiv[^,\n]*)',
+            r'(Archiv\s+(?:der|des|für|im)[^,\n]+)',
+            r'([A-ZÄÖÜ][a-zäöüß]+(?:stadt|Stadt)\s+[A-ZÄÖÜ][a-zäöüß]+\s+[^,\n]*[Aa]rchiv[^,\n]*)',
         ]
 
         for pattern in patterns:
-            match = re.search(pattern, text)
+            match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 return match.group(1).strip()
 
@@ -218,12 +271,11 @@ class ArchivportalScraper:
         url = urljoin(base_url, link.get('href', ''))
 
         full_text = soup.get_text(' ', strip=True)
-
         meta_text = full_text.replace(titre, '', 1).strip()
 
         periode = self.extract_date(meta_text)
-        lieu = self.extract_location(meta_text, titre)
         institution = self.extract_institution(meta_text)
+        lieu = self.extract_location_ner(meta_text, institution)
 
         return Initiative(
             titre=titre,
@@ -233,7 +285,7 @@ class ArchivportalScraper:
             institution=institution
         )
 
-    async def parse_list_page(self, html: str, page_url: str = "") -> list[Initiative]:
+    async def parse_list_page(self, html: str, page_url: str = "") -> list[tuple[Initiative, str]]:
         soup = BeautifulSoup(html, 'html.parser')
         results = []
 
@@ -246,7 +298,7 @@ class ArchivportalScraper:
 
             initiative = self.parse_list_item(item_html, BASE_URL)
             if initiative:
-                results.append(initiative)
+                results.append((initiative, item_html))
             else:
                 item_url = link.get('href', '')
                 self.parse_failures.append({
@@ -257,7 +309,7 @@ class ArchivportalScraper:
 
         return results
 
-    def add_result(self, initiative: Initiative) -> bool:
+    def add_result(self, initiative: Initiative, html_source: str = "") -> bool:
         key = initiative.hash_key()
         if key in self.seen_hashes:
             self.duplicates.append({
@@ -265,10 +317,12 @@ class ArchivportalScraper:
                 'periode': initiative.periode,
                 'lieu': initiative.lieu,
                 'url': initiative.url,
-                'raison': 'doublon'
+                'raison': 'doublon',
+                'html_doublon': html_source,
+                'html_original': self.seen_hashes[key]
             })
             return False
-        self.seen_hashes.add(key)
+        self.seen_hashes[key] = html_source
         self.results.append(initiative)
         return True
 
@@ -295,8 +349,8 @@ class ArchivportalScraper:
             html = await self.fetch(url)
             if html:
                 items = await self.parse_list_page(html, page_url=url)
-                for item in items:
-                    if self.add_result(item):
+                for item, item_html in items:
+                    if self.add_result(item, item_html):
                         pbar.update(1)
 
         batch_size = 10
@@ -326,41 +380,6 @@ class ArchivportalScraper:
                 writer.writerow(init.to_dict())
         print(f"\n  CSV exporté: {filepath}")
 
-    def export_missing(self, filepath: Path):
-        all_missing = []
-
-        for dup in self.duplicates:
-            all_missing.append({
-                'type': 'doublon',
-                'url': dup.get('url', ''),
-                'titre': dup.get('titre', ''),
-                'details': f"periode={dup.get('periode', '')}, lieu={dup.get('lieu', '')}"
-            })
-
-        for err in self.errors:
-            all_missing.append({
-                'type': 'erreur_reseau',
-                'url': err.get('url', ''),
-                'titre': '',
-                'details': err.get('error', f"status={err.get('status', 'unknown')}")
-            })
-
-        for fail in self.parse_failures:
-            all_missing.append({
-                'type': 'parsing_failed',
-                'url': fail.get('url', ''),
-                'titre': '',
-                'details': f"source={fail.get('page_source', '')}"
-            })
-
-        if all_missing:
-            with open(filepath, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=['type', 'url', 'titre', 'details'])
-                writer.writeheader()
-                writer.writerows(all_missing)
-            print(f"  Manquants exportés: {filepath} ({len(all_missing)} entrées)")
-
-
 async def main():
     parser = argparse.ArgumentParser(
         description="Scraper Archivportal-D pour Bürgerinitiativen",
@@ -385,7 +404,6 @@ Exemples:
         if scraper.results:
             base_path = output_dir / args.output
             scraper.export_csv(base_path.with_suffix('.csv'))
-            scraper.export_missing(output_dir / "missing.csv")
 
     print(f"\n  Output files in: {output_dir.absolute()}")
 
