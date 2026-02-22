@@ -139,29 +139,23 @@ class ArchivportalScraper:
 
         return "Non spécifiée"
 
-    # Mots d'archive qui ne sont pas des lieux
     _ARCHIVE_WORDS = {
         'stadtarchiv', 'kreisarchiv', 'landesarchiv', 'hauptstaatsarchiv',
         'bundesarchiv', 'archiv', 'sammlung', 'bibliothek', 'bürgerinitiativen',
         'staatsarchiv', 'universitätsarchiv', 'bezirksarchiv', 'gemeindearchiv',
     }
 
-    # Regex pour enlever le préfixe archive d'un nom d'ORG/LOC
-    # Gère les mots composés (Kreisarchiv, Landeshauptarchiv) et les adjectifs (Bayerisches)
     _ARCHIVE_STRIP = re.compile(
         r'^(?:[A-ZÄÖÜ][a-zäöüß]+(?:s|es|isches?|ische|er|ern)\s+)?'  # adjectif optionnel
-        r'[A-Za-zäöüÄÖÜß]*[Aa]rchiv\w*\s*'                            # mot d'archive composé
         r'(?:des\s+)?(?:Landkreises?\s+|Kreises?\s+)?'                 # préfixe géo optionnel
     )
 
-    # Adjectifs de Länder → nom du Land
     _ADJEKTIV_LAND = {
         r'[Bb]ayer': 'Bayern',
         r'[Ss]ächs': 'Sachsen',
         r'[Bb]randenburg': 'Brandenburg',
         r'[Hh]ess': 'Hessen',
         r'[Tt]hüring': 'Thüringen',
-        r'[Nn]iedersächs': 'Niedersachsen',
         r'[Mm]ecklenb': 'Mecklenburg-Vorpommern',
         r'[Ww]estfäl': 'Nordrhein-Westfalen',
         r'[Ss]aarländ': 'Saarland',
@@ -171,11 +165,18 @@ class ArchivportalScraper:
         r'[Bb]erliner': 'Berlin',
     }
 
+    _INSTITUTION_LOCATION = {
+        'Bundesarchiv': 'Deutschland',
+        'FFBIZ': 'Berlin',
+        'Archiv für Diakonie': 'Berlin',
+        'Akademie der Künste': 'Berlin',
+        'Digitales Deutsches Frauenarchiv': 'Berlin',
+        'KIT-Archiv': 'Karlsruhe',
+    }
+
     def _loc_from_archive_name(self, name: str) -> Optional[str]:
-        """Extrait le lieu depuis un nom d'archive (LOC ou ORG contenant 'archiv')."""
         stripped = self._ARCHIVE_STRIP.sub('', name).strip()
-        stripped = re.sub(r'^(?:des|der)\s+', '', stripped).strip()
-        # Nettoyer les suffixes parasites: parenthèses, points de suspension, ellipses
+        stripped = re.sub(r'^(?:des|der|für|im|am|bei)\s+', '', stripped).strip()
         stripped = re.sub(r'\s*[\(\[\.]{1,}.*', '', stripped, flags=re.DOTALL).strip()
         if stripped and len(stripped) > 2 and stripped[0].isupper() and stripped.lower() not in self._ARCHIVE_WORDS:
             return stripped
@@ -183,11 +184,14 @@ class ArchivportalScraper:
             if re.search(pattern, name):
                 return land
         return None
-
-    def extract_location_ner(self, meta_text: str, institution: str) -> str:
+    def extract_location_ner(self, meta_text: str, institution: str, titre: str = "") -> str:
         """Extrait le lieu via NER spaCy, d'abord sur l'institution puis sur le meta."""
-        # Recherche en deux passes: institution seule (fiable), puis meta complet (fallback)
-        for text in (institution, f"{institution} {meta_text}"):
+        if institution and any(w in institution.lower() for w in ('archiv', 'bibliothek')):
+            result = self._loc_from_archive_name(institution)
+            if result:
+                return result
+
+        for text in (institution, f"{institution} {meta_text}", titre):
             doc = self.nlp(text)
 
             for ent in doc.ents:
@@ -196,7 +200,6 @@ class ArchivportalScraper:
 
                 name = ent.text.strip()
 
-                # Nom d'archive (LOC ou ORG): extraire la partie géographique
                 if any(w in name.lower() for w in ('archiv', 'bibliothek')):
                     result = self._loc_from_archive_name(name)
                     if result:
@@ -206,13 +209,11 @@ class ArchivportalScraper:
                 if ent.label_ == 'ORG':
                     continue
 
-                # LOC/GPE: filtrer les faux positifs
                 if len(name) <= 2 or name.lower() in self._ARCHIVE_WORDS:
                     continue
                 if not name[0].isupper():
                     continue  # Commence par minuscule ("für soziale Bewegung")
                 if re.search(r'\d', name):
-                    continue  # Contient des chiffres (références d'archive)
                 if re.match(r'^[A-ZÄÖÜ][\s\-]', name):
                     continue  # Lettre isolée ("F Rep", "D 10")
                 if len(name) <= 8 and len(name) >= 2 and name[1].isupper():
@@ -220,33 +221,27 @@ class ArchivportalScraper:
                 if re.search(r'\.{2,}', name):
                     continue  # Contient des points de suspension
 
-                # Nettoyer préfixes administratifs ("Landkreises Barnim" → "Barnim")
                 name = re.sub(r'^(?:Landkreises?|Kreises?)\s+', '', name).strip()
-                if not name or len(name) <= 2:
                     continue
 
-                # Adjectif seul ("Märkischer") → inclure "Kreis" si suit
                 if ent.end < len(doc) and doc[ent.end].text in ('Kreis', 'Land'):
                     name = f"{name} {doc[ent.end].text}"
 
                 return name
 
+        for key, loc in self._INSTITUTION_LOCATION.items():
+            if key in institution or key in meta_text or key in titre:
+                return loc
+
         return "Non spécifié"
 
     def extract_institution(self, text: str) -> str:
-        """Extrait l'institution depuis le texte meta (format: date, institution, reference)."""
-        # Le texte est souvent: "1977-1980, Stadtarchiv Tübingen, D 10/251 ..."
-        # On cherche la partie entre la première et deuxième virgule après la date
-
-        # Pattern pour capturer l'institution après la date
         match = re.search(r'^\s*[\d\-–\s\.]+,\s*([^,]+(?:,[^,]+)?)', text)
         if match:
             institution = match.group(1).strip()
-            # Vérifier que ça ressemble à une institution (contient archiv, bibliothek, etc.)
             if re.search(r'(?:archiv|bibliothek|museum|institut|sammlung)', institution, re.IGNORECASE):
                 return institution
 
-        # Fallback: chercher des patterns connus
         patterns = [
             r'((?:Stadt|Landes|Bundes|Kreis|Universitäts)[a-zäöüß]*archiv[^,\n]*)',
             r'(Archiv\s+(?:der|des|für|im)[^,\n]+)',
@@ -267,15 +262,15 @@ class ArchivportalScraper:
         if not link:
             return None
 
-        titre = link.get_text(strip=True)
+        titre = re.sub(r'\s+', ' ', link.get_text(separator=' ')).strip()
         url = urljoin(base_url, link.get('href', ''))
 
-        full_text = soup.get_text(' ', strip=True)
-        meta_text = full_text.replace(titre, '', 1).strip()
+        subtitle_div = soup.find('div', class_='subtitle')
+        meta_text = subtitle_div.get_text(' ', strip=True) if subtitle_div else ""
 
         periode = self.extract_date(meta_text)
         institution = self.extract_institution(meta_text)
-        lieu = self.extract_location_ner(meta_text, institution)
+        lieu = self.extract_location_ner(meta_text, institution, titre)
 
         return Initiative(
             titre=titre,
@@ -290,6 +285,8 @@ class ArchivportalScraper:
         results = []
 
         for link in soup.find_all('a', href=re.compile(r'/item/')):
+            if not link.get_text(strip=True):
+                continue
             parent = link.find_parent(['li', 'div', 'article', 'tr'])
             if parent:
                 item_html = str(parent)
@@ -309,6 +306,46 @@ class ArchivportalScraper:
 
         return results
 
+    async def fetch_detail_location(self, url: str) -> Optional[str]:
+        html = await self.fetch(url)
+        if not html:
+            return None
+
+        soup = BeautifulSoup(html, 'html.parser')
+            text = a.get_text(strip=True)
+            if not text:
+                continue
+            lieu = self.extract_location_ner(text, text)
+            if lieu != "Non spécifié":
+                return lieu
+
+        return None
+
+    async def enrich_missing_locations(self) -> int:
+        no_loc = [i for i in self.results if i.lieu == "Non spécifié"]
+        if not no_loc:
+            return 0
+
+        print(f"\n[3/3] Fallback pages de détail ({len(no_loc)} items sans lieu)...")
+        found = 0
+        pbar = tqdm(total=len(no_loc), desc="      Fallback", unit="item")
+
+        async def process_detail(initiative: Initiative):
+            nonlocal found
+            lieu = await self.fetch_detail_location(initiative.url)
+            if lieu:
+                initiative.lieu = lieu
+                found += 1
+            pbar.update(1)
+
+        batch_size = 10
+        for i in range(0, len(no_loc), batch_size):
+            batch = no_loc[i:i + batch_size]
+            await asyncio.gather(*[process_detail(init) for init in batch])
+
+        pbar.close()
+        return found
+
     def add_result(self, initiative: Initiative, html_source: str = "") -> bool:
         key = initiative.hash_key()
         if key in self.seen_hashes:
@@ -327,15 +364,14 @@ class ArchivportalScraper:
         return True
 
     async def scrape_all(self) -> list[Initiative]:
-        print("\n[1/2] Récupération du nombre total de résultats...")
+        print("\n[1/3] Récupération du nombre total de résultats...")
         total = await self.get_total_results()
         if total == 0:
             print("Error: dans scrape_all")
             return []
 
         print(f"      -> {total} résultats à traiter")
-
-        print(f"\n[2/2] Extraction des données...")
+        print(f"\n[2/3] Extraction des données depuis les pages de liste...")
 
         pages = (total + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE
         urls = [
@@ -360,8 +396,13 @@ class ArchivportalScraper:
 
         pbar.close()
 
+        found_via_detail = await self.enrich_missing_locations()
+
+        remaining = sum(1 for i in self.results if i.lieu == "Non spécifié")
         print(f"\n{'=' * 60}")
         print(f"  Done: {len(self.results)} initiatives extraites")
+        print(f"  Lieux trouvés via fallback: {found_via_detail}")
+        print(f"  Lieux toujours manquants:   {remaining}")
         missing = len(self.errors) + len(self.duplicates) + len(self.parse_failures)
         if missing > 0:
             print(f"  Manquants: {missing}")
@@ -404,9 +445,6 @@ Exemples:
         if scraper.results:
             base_path = output_dir / args.output
             scraper.export_csv(base_path.with_suffix('.csv'))
-
-    print(f"\n  Output files in: {output_dir.absolute()}")
-
 
 if __name__ == "__main__":
     asyncio.run(main())
