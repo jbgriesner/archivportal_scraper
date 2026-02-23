@@ -5,6 +5,7 @@ import aiohttp
 import argparse
 import csv
 import hashlib
+import json
 import re
 import sys
 from dataclasses import dataclass, asdict
@@ -17,10 +18,9 @@ try:
     from bs4 import BeautifulSoup
     from tqdm import tqdm
     import spacy
+    from transformers import MarianMTModel, MarianTokenizer
 except ImportError as e:
     print(f"Error: missing dependencies")
-    print(f"  Linux/Mac: ./setup.sh")
-    print(f"  Windows:   setup.bat")
     sys.exit(1)
 
 BASE_URL = "https://www.archivportal-d.de"
@@ -39,6 +39,7 @@ class Initiative:
     lieu: str
     url: str = ""
     institution: str = ""
+    titre_fr: str = ""
 
     def to_dict(self):
         return asdict(self)
@@ -49,6 +50,57 @@ class Initiative:
             return match.group(1)
         key = f"{self.titre.lower().strip()}|{self.periode}|{self.lieu.lower().strip()}"
         return hashlib.md5(key.encode()).hexdigest()
+
+
+class TitleTranslator:
+    MODEL_NAME = "Helsinki-NLP/opus-mt-de-fr"
+    BATCH_SIZE = 32
+
+    def __init__(self, cache_path: Path):
+        self.cache_path = cache_path
+        self.cache: dict[str, str] = self._load_cache()
+        self._model = None
+        self._tokenizer = None
+
+    def _load_cache(self) -> dict[str, str]:
+        if self.cache_path.exists():
+            try:
+                return json.loads(self.cache_path.read_text(encoding='utf-8'))
+            except (json.JSONDecodeError, OSError):
+                pass
+        return {}
+
+    def _save_cache(self):
+        self.cache_path.write_text(
+            json.dumps(self.cache, ensure_ascii=False, indent=2),
+            encoding='utf-8'
+        )
+
+    def _load_model(self):
+        if self._model is None:
+            self._tokenizer = MarianTokenizer.from_pretrained(self.MODEL_NAME)
+            self._model = MarianMTModel.from_pretrained(self.MODEL_NAME)
+
+    def translate_batch(self, texts: list[str]) -> list[str]:
+        self._load_model()
+        inputs = self._tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=512)
+        translated = self._model.generate(**inputs)
+        return [self._tokenizer.decode(t, skip_special_tokens=True) for t in translated]
+
+    def translate(self, initiatives: list) -> None:
+        to_translate = [i.titre for i in initiatives if i.titre not in self.cache]
+        unique_new = list(dict.fromkeys(to_translate))
+
+        if unique_new:
+            for start in range(0, len(unique_new), self.BATCH_SIZE):
+                batch = unique_new[start:start + self.BATCH_SIZE]
+                translations = self.translate_batch(batch)
+                for src, tgt in zip(batch, translations):
+                    self.cache[src] = tgt
+            self._save_cache()
+
+        for init in initiatives:
+            init.titre_fr = self.cache.get(init.titre, "")
 
 
 class ArchivportalScraper:
@@ -360,7 +412,7 @@ class ArchivportalScraper:
         if not no_loc:
             return 0
 
-        print(f"\n[3/3] Fallback pages de détail ({len(no_loc)} items sans lieu)...")
+        print(f"\n[3/4] Fallback pages de détail ({len(no_loc)} items sans lieu)...")
         found = 0
         pbar = tqdm(total=len(no_loc), desc="      Fallback", unit="item")
 
@@ -392,15 +444,15 @@ class ArchivportalScraper:
         self.results.append(initiative)
         return True
 
-    async def scrape_all(self) -> list[Initiative]:
-        print("\n[1/3] Récupération du nombre total de résultats...")
+    async def scrape_all(self, translator: Optional['TitleTranslator'] = None) -> list[Initiative]:
+        print("\n[1/4] Récupération du nombre total de résultats...")
         total = await self.get_total_results()
         if total == 0:
             print("Error: dans scrape_all")
             return []
 
         print(f"      -> {total} résultats à traiter")
-        print(f"\n[2/3] Extraction des données depuis les pages de liste...")
+        print(f"\n[2/4] Extraction des données depuis les pages de liste...")
 
         pages = (total + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE
         urls = [
@@ -427,6 +479,23 @@ class ArchivportalScraper:
 
         found_via_detail = await self.enrich_missing_locations()
 
+        if translator is not None:
+            print(f"\n[4/4] Traduction DE→FR ({len(self.results)} titres)...")
+            pbar = tqdm(total=len(self.results), desc="      Traduction", unit="item")
+            unique_titles = list(dict.fromkeys(i.titre for i in self.results))
+            for start in range(0, len(unique_titles), TitleTranslator.BATCH_SIZE):
+                batch_titles = unique_titles[start:start + TitleTranslator.BATCH_SIZE]
+                uncached = [t for t in batch_titles if t not in translator.cache]
+                if uncached:
+                    translations = translator.translate_batch(uncached)
+                    for src, tgt in zip(uncached, translations):
+                        translator.cache[src] = tgt
+                pbar.update(len(batch_titles))
+            translator._save_cache()
+            for init in self.results:
+                init.titre_fr = translator.cache.get(init.titre, "")
+            pbar.close()
+
         remaining = sum(1 for i in self.results if i.lieu == "Non spécifié")
         print(f"\n{'=' * 60}")
         print(f"  Done: {len(self.results)} initiatives extraites")
@@ -444,7 +513,7 @@ class ArchivportalScraper:
 
     def export_csv(self, filepath: Path):
         with open(filepath, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=['titre', 'periode', 'lieu', 'institution', 'url'])
+            writer = csv.DictWriter(f, fieldnames=['titre', 'titre_fr', 'periode', 'lieu', 'institution', 'url'])
             writer.writeheader()
             for init in self.results:
                 writer.writerow(init.to_dict())
@@ -468,8 +537,10 @@ Exemples:
     output_dir = Path(__file__).parent / "output"
     output_dir.mkdir(exist_ok=True)
 
+    translator = TitleTranslator(cache_path=output_dir / "translation_cache.json")
+
     async with ArchivportalScraper() as scraper:
-        await scraper.scrape_all()
+        await scraper.scrape_all(translator=translator)
 
         if scraper.results:
             base_path = output_dir / args.output
