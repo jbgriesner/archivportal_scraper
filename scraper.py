@@ -480,9 +480,9 @@ class ArchivportalScraper:
         found_via_detail = await self.enrich_missing_locations()
 
         if translator is not None:
-            print(f"\n[4/4] Traduction DE→FR ({len(self.results)} titres)...")
-            pbar = tqdm(total=len(self.results), desc="      Traduction", unit="item")
             unique_titles = list(dict.fromkeys(i.titre for i in self.results))
+            print(f"\n[4/4] Traduction DE→FR ({len(unique_titles)} titres uniques / {len(self.results)} items)...")
+            pbar = tqdm(total=len(unique_titles), desc="      Traduction", unit="titre")
             for start in range(0, len(unique_titles), TitleTranslator.BATCH_SIZE):
                 batch_titles = unique_titles[start:start + TitleTranslator.BATCH_SIZE]
                 uncached = [t for t in batch_titles if t not in translator.cache]
@@ -512,11 +512,14 @@ class ArchivportalScraper:
         return self.results
 
     def export_csv(self, filepath: Path):
+        def sanitize(row: dict) -> dict:
+            return {k: v.replace('"', "'") if isinstance(v, str) else v for k, v in row.items()}
+
         with open(filepath, 'w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=['titre', 'titre_fr', 'periode', 'lieu', 'institution', 'url'])
             writer.writeheader()
             for init in self.results:
-                writer.writerow(init.to_dict())
+                writer.writerow(sanitize(init.to_dict()))
         print(f"\n  CSV exporté: {filepath}")
 
 async def main():
